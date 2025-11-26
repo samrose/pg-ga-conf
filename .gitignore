@@ -1,0 +1,26 @@
+# Elixir
+/_build
+/cover
+/deps
+/doc
+/.fetch
+erl_crash.dump
+*.ez
+*.beam
+/config/*.secret.exs
+.elixir_ls/
+
+# Development
+.DS_Store
+.postgres/
+.nix-*
+result
+result-*
+
+# Scans and results
+/scans/
+/results/
+
+# Environment
+.env
+.envrc
