@@ -1,0 +1,73 @@
+version: '3.8'
+
+services:
+  # PostgreSQL database for testing
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: pgbench
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Julia Sobol Analysis Server
+  julia:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.julia
+    environment:
+      SERVER_MODE: tcp
+      SERVER_PORT: "9999"
+      JULIA_NUM_THREADS: "4"
+    ports:
+      - "9999:9999"
+    healthcheck:
+      test: ["CMD", "julia", "--project=/app", "-e", "using Sockets; sock = connect(\"127.0.0.1\", 9999); close(sock)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+
+  # PgGaConf Elixir Application
+  pgga:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.elixir
+    environment:
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/pgbench"
+      JULIA_SERVICE_HOST: julia
+      JULIA_SERVICE_PORT: "9999"
+      SECRET_KEY_BASE: "${SECRET_KEY_BASE:-supersecretkey_for_development_only_change_in_prod}"
+      POOL_SIZE: "10"
+    ports:
+      - "4000:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      julia:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+
+volumes:
+  postgres_data:
+
+networks:
+  default:
+    name: pgga-network

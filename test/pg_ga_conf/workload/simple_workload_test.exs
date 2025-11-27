@@ -1,6 +1,8 @@
 defmodule PgGaConf.Workload.SimpleWorkloadTest do
   use ExUnit.Case, async: false
 
+  @moduletag :integration
+
   alias PgGaConf.Workload.SimpleWorkload
   alias PgGaConf.TestHelpers
 

@@ -6,12 +6,29 @@ defmodule PgGaConf.Core.DatabaseScanner do
   require Logger
 
   alias PgGaConf.Core.ScanResult
+  alias PgGaConf.DataGenerator.DataProfiler
 
   @doc """
   Performs a comprehensive scan of the database.
+
+  ## Options
+    * `:profile_data` - Whether to profile data distributions (default: true)
   """
-  def scan_database(conn) do
+  def scan_database(conn, opts \\ []) do
     Logger.info("Starting comprehensive database scan...")
+
+    profile_data = Keyword.get(opts, :profile_data, true)
+
+    tables = scan_tables_detailed(conn)
+    columns = scan_columns_detailed(conn)
+
+    data_profiles =
+      if profile_data do
+        Logger.info("Profiling data distributions...")
+        DataProfiler.profile_database(conn, tables, columns)
+      else
+        []
+      end
 
     ScanResult.new(%{
       roles: scan_roles(conn),
@@ -19,8 +36,8 @@ defmodule PgGaConf.Core.DatabaseScanner do
       enums: scan_enums(conn),
       schemas: scan_schemas(conn),
       sequences: scan_sequences(conn),
-      tables: scan_tables_detailed(conn),
-      columns: scan_columns_detailed(conn),
+      tables: tables,
+      columns: columns,
       primary_keys: scan_primary_keys(conn),
       foreign_keys: scan_foreign_keys(conn),
       unique_constraints: scan_unique_constraints(conn),
@@ -29,7 +46,7 @@ defmodule PgGaConf.Core.DatabaseScanner do
       views: scan_views(conn),
       functions: scan_functions(conn),
       triggers: scan_triggers(conn),
-      data_profiles: [],  # Will implement in next task
+      data_profiles: data_profiles,
       query_patterns: scan_query_patterns(conn)
     })
   end

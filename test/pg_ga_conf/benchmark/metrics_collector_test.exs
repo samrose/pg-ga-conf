@@ -1,6 +1,8 @@
 defmodule PgGaConf.Benchmark.MetricsCollectorTest do
   use ExUnit.Case, async: false
 
+  @moduletag :integration
+
   alias PgGaConf.Benchmark.MetricsCollector
   alias PgGaConf.Core.Metrics
   alias PgGaConf.TestHelpers

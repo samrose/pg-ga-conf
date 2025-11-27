@@ -1,6 +1,8 @@
 defmodule PgGaConf.Instance.LocalPostgresTest do
   use ExUnit.Case, async: false
 
+  @moduletag :integration
+
   alias PgGaConf.Instance.LocalPostgres
   alias PgGaConf.Core.ConfigChromosome
 

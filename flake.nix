@@ -12,22 +12,33 @@
         pkgs = nixpkgs.legacyPackages.${system};
 
         # Elixir and Erlang versions
-        beam = pkgs.beam.packagesWith pkgs.beam.interpreters.erlang_26;
-        elixir = beam.elixir_1_16;
+        erlang = pkgs.beam.interpreters.erlang_27;
+        beam = pkgs.beam.packagesWith erlang;
+        elixir = beam.elixir_1_18;
+        rebar3 = beam.rebar3;
 
         # PostgreSQL for local development
         postgresql = pkgs.postgresql_15;
+
+        # Julia for Sobol sensitivity analysis
+        julia = pkgs.julia-bin;
 
       in {
         # Development shell
         devShells.default = pkgs.mkShell {
           buildInputs = [
+            erlang
             elixir
+            rebar3
             postgresql
+            julia
             pkgs.git
             pkgs.docker
             pkgs.curl
             pkgs.jq
+            pkgs.python311  # For Pythonx
+            pkgs.gcc        # For erlexec native compilation
+            pkgs.gnumake    # For erlexec native compilation
           ];
 
           shellHook = ''
@@ -37,12 +48,21 @@
             export PGPORT=5432
             export DATABASE_URL="postgresql://postgres@localhost:5432/pgga_dev"
 
+            # Elixir/Mix paths
+            export MIX_HOME="$PWD/.nix-mix"
+            export HEX_HOME="$PWD/.nix-hex"
+
+            # Julia project path
+            export JULIA_PROJECT="$PWD/priv/julia"
+            export JULIA_SERVICE_MODE="local"
+
             # Initialize PostgreSQL if needed
             if [ ! -d "$PGDATA" ]; then
               echo "Initializing PostgreSQL database..."
               initdb -U postgres --no-locale --encoding=UTF8
               echo "unix_socket_directories = '$PGDATA'" >> "$PGDATA/postgresql.conf"
               echo "listen_addresses = 'localhost'" >> "$PGDATA/postgresql.conf"
+              echo "shared_preload_libraries = 'pg_stat_statements'" >> "$PGDATA/postgresql.conf"
 
               # Start postgres temporarily to set up
               pg_ctl start -l "$PGDATA/logfile" -o "-c unix_socket_directories=$PGDATA"
@@ -57,7 +77,14 @@
               pg_ctl stop
             fi
 
-            echo "PostgreSQL ready. Commands:"
+            # Initialize Julia project if needed
+            if [ ! -f "$JULIA_PROJECT/Manifest.toml" ] && [ -f "$JULIA_PROJECT/Project.toml" ]; then
+              echo "Installing Julia dependencies..."
+              julia --project="$JULIA_PROJECT" -e 'using Pkg; Pkg.instantiate()'
+            fi
+
+            echo ""
+            echo "PostgreSQL commands:"
             echo "  pg_start     - Start PostgreSQL"
             echo "  pg_stop      - Stop PostgreSQL"
             echo "  pg_connect   - Connect to dev database"
@@ -66,6 +93,9 @@
             echo "  mix deps.get - Install dependencies"
             echo "  mix test     - Run tests"
             echo "  iex -S mix   - Start interactive shell"
+            echo ""
+            echo "Julia commands:"
+            echo "  julia --project=priv/julia - Start Julia REPL"
 
             # Helper functions
             pg_start() {

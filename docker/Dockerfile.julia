@@ -1,0 +1,39 @@
+# Julia Sobol Sensitivity Analysis Server
+FROM julia:1.10-bookworm
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy Julia project files
+COPY priv/julia/Project.toml priv/julia/Manifest.toml ./
+
+# Instantiate project and precompile
+RUN julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
+
+# Copy server code
+COPY priv/julia/*.jl ./
+
+# Create non-root user
+RUN groupadd -r julia && useradd -r -g julia julia && \
+    chown -R julia:julia /app
+
+USER julia
+
+# Environment variables
+ENV JULIA_PROJECT="/app"
+ENV JULIA_NUM_THREADS="auto"
+ENV SERVER_MODE="tcp"
+ENV SERVER_PORT="9999"
+
+EXPOSE 9999
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD julia --project=/app -e 'using Sockets; sock = connect("127.0.0.1", 9999); println(sock, "{\"type\":\"ping\"}"); close(sock)' || exit 1
+
+# Run server in TCP mode
+ENTRYPOINT ["julia", "--project=/app", "server.jl"]
+CMD ["--mode=tcp", "--port=9999"]

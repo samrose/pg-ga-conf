@@ -1,6 +1,8 @@
 defmodule PgGaConf.Benchmark.EvaluatorTest do
   use ExUnit.Case, async: false
 
+  @moduletag :integration
+
   alias PgGaConf.Benchmark.Evaluator
   alias PgGaConf.Core.{ConfigChromosome, Metrics}
   alias PgGaConf.TestHelpers
