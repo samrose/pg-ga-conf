@@ -110,7 +110,10 @@ defmodule PgGaConf.Benchmark.Pgbench do
         # Check if restart is needed
         if needs_restart?(config) do
           Logger.warning("Some parameters require restart: #{inspect(restart_params(config))}")
-          restart_postgres(state)
+          # Use PostgresLifecycle to restart only the TARGET database
+          # This preserves the App DB (Repo) connection
+          restart_config = Map.take(config, __MODULE__.restart_required_params_atoms())
+          PgGaConf.PostgresLifecycle.restart_target(config: restart_config)
         else
           :ok
         end
@@ -396,74 +399,7 @@ defmodule PgGaConf.Benchmark.Pgbench do
     |> Enum.filter(&(&1 in @restart_required_params))
   end
 
-  defp restart_postgres(state) do
-    Logger.info("Restarting PostgreSQL to apply configuration changes...")
-
-    # Try pg_ctl restart first (works with local PostgreSQL)
-    pgdata = System.get_env("PGDATA")
-
-    if pgdata && File.dir?(pgdata) do
-      # Use pg_ctl for local PostgreSQL managed by nix develop
-      case System.cmd("pg_ctl", ["restart", "-D", pgdata, "-w", "-t", "30"],
-             stderr_to_stdout: true) do
-        {_output, 0} ->
-          Logger.info("PostgreSQL restarted successfully")
-          # Wait for PostgreSQL to be ready
-          wait_for_postgres(state, 10)
-
-        {output, code} ->
-          Logger.warning("pg_ctl restart failed (#{code}): #{output}")
-          # Try alternative: stop and start
-          try_stop_start(pgdata, state)
-      end
-    else
-      # Try using pg_ctl with connection info
-      Logger.warning("PGDATA not set, attempting restart via pg_ctl")
-      case System.cmd("pg_ctl", ["restart", "-w", "-t", "30"], stderr_to_stdout: true) do
-        {_output, 0} ->
-          Logger.info("PostgreSQL restarted successfully")
-          wait_for_postgres(state, 10)
-
-        {output, _code} ->
-          Logger.error("PostgreSQL restart failed: #{output}")
-          {:error, :restart_failed}
-      end
-    end
-  end
-
-  defp try_stop_start(pgdata, state) do
-    Logger.info("Trying stop/start sequence...")
-
-    # Stop
-    System.cmd("pg_ctl", ["stop", "-D", pgdata, "-m", "fast", "-w"], stderr_to_stdout: true)
-    Process.sleep(1_000)
-
-    # Start
-    case System.cmd("pg_ctl", ["start", "-D", pgdata, "-w", "-l", "#{pgdata}/logfile"],
-           stderr_to_stdout: true) do
-      {_output, 0} ->
-        Logger.info("PostgreSQL started successfully")
-        wait_for_postgres(state, 10)
-
-      {output, code} ->
-        Logger.error("PostgreSQL start failed (#{code}): #{output}")
-        {:error, :restart_failed}
-    end
-  end
-
-  defp wait_for_postgres(state, retries) when retries > 0 do
-    case run_psql("SELECT 1", state) do
-      {:ok, _} ->
-        :ok
-
-      {:error, _} ->
-        Process.sleep(1_000)
-        wait_for_postgres(state, retries - 1)
-    end
-  end
-
-  defp wait_for_postgres(_state, 0) do
-    Logger.error("PostgreSQL did not become ready after restart")
-    {:error, :postgres_not_ready}
-  end
+  # Note: restart_postgres/1, try_stop_start/2, wait_for_postgres/2 removed
+  # PostgreSQL restart is now handled by PgGaConf.PostgresLifecycle.restart_target/1
+  # which only restarts the Target DB (port 5433), leaving App DB (port 5432) untouched
 end

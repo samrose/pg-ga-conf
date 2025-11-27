@@ -1,6 +1,15 @@
 import Config
 
-# Ecto configuration
+# =====================================================
+# TWO-DATABASE ARCHITECTURE
+# =====================================================
+# App DB (port 5432): Stores tuning sessions, results, cache
+#                    NEVER restarted during tuning - used by Repo
+# Target DB (port 5433): The database being tuned/benchmarked
+#                        Restarted when testing restart-required params
+# =====================================================
+
+# Ecto configuration (App DB only)
 config :pg_ga_conf,
   ecto_repos: [PgGaConf.Repo]
 
@@ -14,6 +23,13 @@ config :pg_ga_conf,
   # Default optimizer (:ga, :tpe, :cma_es)
   default_optimizer: :tpe,
   max_iterations: 30,
+
+  # Target database defaults (the DB being tuned)
+  target_db_port: 5433,
+  target_db_host: "localhost",
+  target_db_user: "postgres",
+  target_db_password: "",
+  target_db_name: "pgga_target",
 
   # Benchmark defaults
   benchmark_duration: 60,
