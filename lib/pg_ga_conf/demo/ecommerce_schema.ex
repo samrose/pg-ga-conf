@@ -616,10 +616,10 @@ defmodule PgGaConf.Demo.EcommerceSchema do
           user_id = :rand.uniform(max_user_id)
           ship_addr = if max_addr_id > 0, do: :rand.uniform(max_addr_id), else: "NULL"
           bill_addr = if max_addr_id > 0 && :rand.uniform() > 0.5, do: :rand.uniform(max_addr_id), else: ship_addr
-          subtotal = :rand.uniform(100000) / 100 + 10
+          subtotal = :rand.uniform(100000) / 100 + 10.0
           tax = subtotal * 0.08
-          shipping = if subtotal > 50, do: 0, else: 5.99 + :rand.uniform(1000) / 100
-          discount = if :rand.uniform() > 0.8, do: subtotal * (:rand.uniform(20) / 100), else: 0
+          shipping = if subtotal > 50, do: 0.0, else: 5.99 + :rand.uniform(1000) / 100
+          discount = if :rand.uniform() > 0.8, do: subtotal * (:rand.uniform(20) / 100), else: 0.0
 
           placed = if status != "pending", do: "NOW() - INTERVAL '#{:rand.uniform(365)} days'", else: "NULL"
           shipped = if status in ~w(shipped delivered), do: "#{placed} + INTERVAL '#{:rand.uniform(5)} days'", else: "NULL"
