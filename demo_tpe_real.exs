@@ -25,6 +25,8 @@
 #   TPE_ITERATIONS - Number of optimization iterations (default: 10)
 #   USE_SOBOL - Run Sobol sensitivity analysis (default: true)
 #   SOBOL_SAMPLES - Number of Sobol samples (default: 32)
+#   VALIDATION_DURATION - Duration for final validation benchmark (default: 60)
+#   SKIP_VALIDATION - Skip validation phase (default: false)
 #   CLEANUP - Drop demo database after demo (default: true)
 #   STOP_TARGET - Stop Target DB after demo (default: false)
 
@@ -55,6 +57,8 @@ scale = String.to_integer(System.get_env("PGBENCH_SCALE", "10"))
 iterations = String.to_integer(System.get_env("TPE_ITERATIONS", "10"))
 use_sobol = System.get_env("USE_SOBOL", "true") == "true"
 sobol_samples = String.to_integer(System.get_env("SOBOL_SAMPLES", "32"))
+validation_duration = String.to_integer(System.get_env("VALIDATION_DURATION", "60"))
+skip_validation = System.get_env("SKIP_VALIDATION", "false") == "true"
 cleanup = System.get_env("CLEANUP", "true") == "true"
 stop_target = System.get_env("STOP_TARGET", "false") == "true"
 
@@ -73,6 +77,7 @@ IO.puts "  pgbench: #{duration}s, #{clients} clients, scale #{scale}"
 IO.puts "  TPE iterations: #{iterations}"
 IO.puts "  Use Sobol: #{use_sobol}"
 if use_sobol, do: IO.puts "  Sobol samples: #{sobol_samples}"
+IO.puts "  Validation: #{if skip_validation, do: "disabled", else: "#{validation_duration}s benchmark"}"
 IO.puts "  Cleanup after demo: #{cleanup}"
 IO.puts ""
 
@@ -430,12 +435,75 @@ try do
     end)
     IO.puts "   SELECT pg_reload_conf();"
     IO.puts "   ----------------------------------------"
+
+    # =====================================================
+    # Step 9: Validation benchmark
+    # =====================================================
+    # WHY VALIDATION MATTERS:
+    # The optimization loop uses short benchmarks (e.g., 10-30s) for speed.
+    # Short benchmarks have higher variance - TPS can fluctuate 5-15% between runs.
+    # The "best" config might have gotten lucky on its benchmark run.
+    #
+    # Validation runs a LONGER benchmark (default 60s) with the winning config.
+    # This confirms the improvement is real, not just noise. If the validation
+    # TPS is close to the optimization TPS, the result is trustworthy.
+    # If it's significantly different, the short benchmarks were too noisy.
+
+    unless skip_validation do
+      IO.puts "\n9. Running validation benchmark (#{validation_duration}s)..."
+      IO.puts "   This confirms the winning config with a longer, more reliable benchmark."
+      IO.puts ""
+
+      # Apply the best config
+      :ok = Benchmark.Pgbench.apply_config(bench_state, best_config)
+      Process.sleep(1_000)
+
+      # Run longer validation benchmark
+      validation_bench_opts = [
+        db_url: db_url,
+        duration: validation_duration,
+        clients: clients,
+        scale: scale
+      ]
+      {:ok, validation_bench_state} = Benchmark.Pgbench.init(validation_bench_opts)
+
+      IO.puts "   Running #{validation_duration}s pgbench with optimized config..."
+      {:ok, _validation_score, validation_metrics} = Benchmark.Pgbench.run(validation_bench_state)
+
+      validated_improvement = (validation_metrics.tps - baseline_metrics.tps) / baseline_metrics.tps * 100
+      optimization_vs_validation = abs(best_metrics.tps - validation_metrics.tps) / best_metrics.tps * 100
+
+      IO.puts ""
+      IO.puts "   ┌─────────────────────────────────────────────────────────────┐"
+      IO.puts "   │                  VALIDATION RESULTS                         │"
+      IO.puts "   ├─────────────────────────────────────────────────────────────┤"
+      IO.puts "   │ Metric        │ Baseline    │ Optimized   │ Validated      │"
+      IO.puts "   ├───────────────┼─────────────┼─────────────┼────────────────┤"
+      IO.puts "   │ TPS           │ #{String.pad_leading(Float.round(baseline_metrics.tps, 1) |> to_string(), 11)} │ #{String.pad_leading(Float.round(best_metrics.tps, 1) |> to_string(), 11)} │ #{String.pad_leading(Float.round(validation_metrics.tps, 1) |> to_string(), 14)} │"
+      IO.puts "   │ Latency (ms)  │ #{String.pad_leading(Float.round(baseline_metrics.latency_avg, 1) |> to_string(), 11)} │ #{String.pad_leading(Float.round(best_metrics.latency_avg, 1) |> to_string(), 11)} │ #{String.pad_leading(Float.round(validation_metrics.latency_avg, 1) |> to_string(), 14)} │"
+      IO.puts "   │ vs Baseline   │           - │ #{String.pad_leading("#{Float.round(tps_improvement, 0)}%", 11)} │ #{String.pad_leading("#{Float.round(validated_improvement, 0)}%", 14)} │"
+      IO.puts "   └─────────────────────────────────────────────────────────────┘"
+      IO.puts ""
+
+      if optimization_vs_validation < 5 do
+        IO.puts "   ✓ Validation passed: Results are consistent (#{Float.round(optimization_vs_validation, 1)}% variance)"
+        IO.puts "   The #{validation_duration}s benchmark confirms the #{Float.round(validated_improvement, 0)}% improvement is real."
+      else
+        IO.puts "   ⚠ High variance detected (#{Float.round(optimization_vs_validation, 1)}% difference)"
+        IO.puts "   The optimization benchmarks may have been too short."
+        IO.puts "   Consider running with longer PGBENCH_DURATION for more reliable results."
+      end
+
+      Benchmark.Pgbench.cleanup(validation_bench_state)
+    else
+      IO.puts "\n9. Skipping validation (SKIP_VALIDATION=true)"
+    end
   end
 
   # =====================================================
-  # Step 9: Demonstrate serialization
+  # Step 10: Demonstrate serialization
   # =====================================================
-  IO.puts "\n9. Demonstrating serialization (crash recovery)..."
+  IO.puts "\n10. Demonstrating serialization (crash recovery)..."
   serialized = TPE.serialize(final_state)
   IO.puts "   Serialized optimizer state: #{byte_size(serialized)} bytes"
   {:ok, _recovered} = TPE.deserialize(serialized)
@@ -460,13 +528,17 @@ What this demo demonstrated:
 2. App DB (port 5432) stayed connected throughout
 3. Target DB (port 5433) was restarted for Sobol batches
 4. TPE optimization with real PostgreSQL config changes
-5. Measurable TPS improvement over baseline
+5. Validation benchmark to confirm results are real, not noise
 
 To run with different settings:
   TPE_ITERATIONS=20 PGBENCH_DURATION=30 mix run demo_tpe_real.exs
 
 To skip Sobol (faster):
   USE_SOBOL=false mix run demo_tpe_real.exs
+
+To customize validation:
+  VALIDATION_DURATION=120 mix run demo_tpe_real.exs  # 2-minute validation
+  SKIP_VALIDATION=true mix run demo_tpe_real.exs    # Skip validation
 
 To preserve database after demo:
   CLEANUP=false mix run demo_tpe_real.exs
