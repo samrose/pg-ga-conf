@@ -14,7 +14,7 @@ defmodule PgGaConf.DataGenerator.DataGenerator do
   alias PgGaConf.Core.ScanResult
   alias PgGaConf.DataGenerator.{DependencyGraph, SchemaBuilder, ValueGenerator}
 
-  @default_batch_size 50_000
+  @default_batch_size 1_000
 
   @doc """
   Generates synthetic data in target database based on scan result.
@@ -123,40 +123,101 @@ defmodule PgGaConf.DataGenerator.DataGenerator do
   end
 
   @doc """
-  Generates data for a single table using COPY protocol.
+  Generates data for a single table.
   """
   def generate_table_data(conn, table, plan, pk_cache, opts) do
     scale = opts[:scale] || 1.0
     batch_size = opts[:batch_size] || @default_batch_size
     progress_fn = opts[:progress_fn]
 
-    row_count = round(table.row_count * scale)
+    row_count = max(1, round(table.row_count * scale))
     table_columns = Enum.filter(plan.columns, &(&1.table == table.name))
-    column_names = Enum.map(table_columns, & &1.name)
 
-    # Find PK column for this table
+    # Filter out auto-generated columns (serial, identity, generated)
+    insertable_columns = Enum.filter(table_columns, fn col ->
+      not is_auto_generated?(col)
+    end)
+
+    column_names = Enum.map(insertable_columns, & &1.name)
+
+    # Find PK column for this table (to track generated values)
     pk_info = Enum.find(plan.primary_keys, &(&1.table == table.name))
     pk_columns = if pk_info, do: pk_info.columns, else: []
+
+    # Find unique constraints for this table
+    unique_columns = get_unique_columns(table.name, plan.unique_constraints)
+    composite_constraints = get_composite_unique_constraints(table.name, plan.unique_constraints)
 
     if progress_fn do
       progress_fn.("Generating #{row_count} rows for #{table.name}")
     end
 
-    # Generate in batches
-    1..row_count
-    |> Stream.chunk_every(batch_size)
-    |> Enum.each(fn batch_range ->
-      generate_batch(conn, table, table_columns, column_names, pk_columns, plan.profiles_map, pk_cache, batch_range)
-    end)
+    # Skip if no insertable columns
+    if Enum.empty?(column_names) do
+      Logger.warning("No insertable columns for #{table.name}, skipping")
+      :ok
+    else
+      # Generate in batches
+      1..row_count
+      |> Stream.chunk_every(batch_size)
+      |> Enum.with_index()
+      |> Enum.each(fn {batch_range, batch_idx} ->
+        generate_batch(conn, table, insertable_columns, column_names, pk_columns,
+                       unique_columns, composite_constraints, plan.profiles_map, pk_cache,
+                       batch_range, batch_idx * batch_size)
+      end)
 
-    :ok
+      :ok
+    end
   end
 
-  defp generate_batch(conn, table, columns, column_names, pk_columns, profiles_map, pk_cache, batch_range) do
+  defp get_unique_columns(table_name, unique_constraints) do
+    table_constraints = Enum.filter(unique_constraints, fn uc ->
+      # Match table name (handle both with and without schema prefix)
+      uc_table = uc.table
+      uc_table == table_name || String.ends_with?(uc_table, ".#{table_name}")
+    end)
+
+    # Single-column unique constraints
+    single_col = table_constraints
+    |> Enum.filter(fn uc -> length(uc.columns) == 1 end)
+    |> Enum.map(fn uc -> hd(uc.columns) end)
+    |> MapSet.new()
+
+    single_col
+  end
+
+  # Get composite unique constraints for a table (returns list of column lists)
+  defp get_composite_unique_constraints(table_name, unique_constraints) do
+    unique_constraints
+    |> Enum.filter(fn uc ->
+      uc_table = uc.table
+      (uc_table == table_name || String.ends_with?(uc_table, ".#{table_name}")) &&
+        length(uc.columns) > 1
+    end)
+    |> Enum.map(fn uc -> uc.columns end)
+  end
+
+  defp is_auto_generated?(column) do
+    cond do
+      # Identity columns
+      column[:is_identity] == true -> true
+      # Serial types (have nextval default)
+      column[:default] && String.contains?(to_string(column[:default]), "nextval") -> true
+      # Generated columns
+      column[:identity_generation] != nil -> true
+      true -> false
+    end
+  end
+
+  defp generate_batch(conn, table, columns, column_names, pk_columns, unique_columns, composite_constraints, profiles_map, pk_cache, batch_range, row_offset) do
     # Generate all rows first
     rows =
-      Enum.map(batch_range, fn _i ->
-        row = generate_row(table.name, columns, profiles_map, pk_cache)
+      batch_range
+      |> Enum.with_index()
+      |> Enum.map(fn {_i, idx} ->
+        row_num = row_offset + idx
+        row = generate_row(table.name, columns, unique_columns, composite_constraints, profiles_map, pk_cache, row_num)
 
         # Track PK values
         Enum.each(pk_columns, fn pk_col ->
@@ -177,81 +238,200 @@ defmodule PgGaConf.DataGenerator.DataGenerator do
         row
       end)
 
-    # Build COPY data
-    copy_data =
-      rows
-      |> Enum.map(&encode_csv_row(&1, column_names))
-      |> Enum.join()
-
-    # Use COPY with data
+    # Build INSERT statement with multiple VALUES
     column_list = Enum.join(column_names, ", ")
 
-    Postgrex.transaction(conn, fn conn ->
-      # Create temp table data and insert via COPY
-      copy_sql = "COPY #{table.schema}.#{table.name} (#{column_list}) FROM STDIN"
+    values_list =
+      rows
+      |> Enum.map(fn row ->
+        values =
+          column_names
+          |> Enum.map(fn col -> format_sql_value(row[col]) end)
+          |> Enum.join(", ")
+        "(#{values})"
+      end)
+      |> Enum.join(",\n")
 
-      case Postgrex.query(conn, copy_sql, [], copy_data: copy_data) do
-        {:ok, _} -> :ok
-        {:error, error} -> Logger.warning("COPY failed: #{inspect(error)}")
-      end
-    end)
+    insert_sql = "INSERT INTO #{table.schema}.#{table.name} (#{column_list}) VALUES #{values_list}"
+
+    case Postgrex.query(conn, insert_sql, []) do
+      {:ok, _} -> :ok
+      {:error, error} -> Logger.warning("INSERT failed for #{table.name}: #{inspect(error)}")
+    end
+  end
+
+  defp format_sql_value(nil), do: "NULL"
+  defp format_sql_value(true), do: "TRUE"
+  defp format_sql_value(false), do: "FALSE"
+  defp format_sql_value(%Date{} = d), do: "'#{Date.to_iso8601(d)}'"
+  defp format_sql_value(%DateTime{} = dt), do: "'#{DateTime.to_iso8601(dt)}'"
+  defp format_sql_value(%NaiveDateTime{} = ndt), do: "'#{NaiveDateTime.to_iso8601(ndt)}'"
+
+  defp format_sql_value(value) when is_map(value) do
+    # JSON values need to be properly escaped for SQL - the JSON itself is valid,
+    # we just need to escape single quotes in the JSON string
+    json = Jason.encode!(value)
+    "'#{String.replace(json, "'", "''")}'"
+  end
+
+  defp format_sql_value(value) when is_list(value) do
+    # Same for arrays encoded as JSON
+    json = Jason.encode!(value)
+    "'#{String.replace(json, "'", "''")}'"
+  end
+
+  defp format_sql_value(value) when is_binary(value) do
+    "'#{escape_sql_string(value)}'"
+  end
+
+  defp format_sql_value(value) when is_integer(value) or is_float(value) do
+    to_string(value)
+  end
+
+  defp format_sql_value(value), do: "'#{escape_sql_string(to_string(value))}'"
+
+  defp escape_sql_string(str) do
+    String.replace(str, "'", "''")
   end
 
   @doc """
   Generates a single row of data for a table.
   """
-  def generate_row(table_name, columns, profiles_map, pk_cache) do
+  def generate_row(table_name, columns, unique_columns, composite_constraints, profiles_map, pk_cache, row_num) do
+    # Build set of columns that are part of composite unique constraints
+    composite_unique_cols = composite_constraints
+    |> List.flatten()
+    |> MapSet.new()
+
     Map.new(columns, fn column ->
       profile = Map.get(profiles_map, {table_name, column.name}, %{})
-      value = generate_value(column, profile, pk_cache)
+      is_unique = MapSet.member?(unique_columns, column.name)
+      in_composite = MapSet.member?(composite_unique_cols, column.name)
+      value = generate_value(column, profile, pk_cache, is_unique, in_composite, table_name, row_num)
       {column.name, value}
     end)
   end
 
-  defp generate_value(column, profile, pk_cache) do
-    # Check null first
-    null_pct = profile[:null_percentage] || 0.0
+  defp generate_value(column, profile, pk_cache, is_unique, in_composite, table_name, row_num) do
+    # For unique columns, generate guaranteed unique values
+    cond do
+      is_unique ->
+        generate_unique_value(column, table_name, row_num)
 
-    if column[:nullable] != false and null_pct > 0 and :rand.uniform() < null_pct do
-      nil
-    else
-      do_generate_value(column, profile, pk_cache)
+      in_composite ->
+        # For composite unique constraints, include row_num to help ensure uniqueness
+        generate_composite_unique_value(column, profile, pk_cache, row_num)
+
+      true ->
+        # Check null first
+        null_pct = profile[:null_percentage] || 0.0
+
+        if column[:nullable] != false and null_pct > 0 and :rand.uniform() < null_pct do
+          nil
+        else
+          do_generate_value(column, profile, pk_cache)
+        end
+    end
+  end
+
+  # For columns in composite unique constraints, bias toward using row_num
+  # to ensure combinations are more likely to be unique
+  defp generate_composite_unique_value(column, profile, pk_cache, row_num) do
+    data_type = column.data_type || column[:udt_name]
+
+    case data_type do
+      t when t in ["integer", "int4", "smallint", "int2", "bigint", "int8"] ->
+        # For integer columns in composite constraints, use row_num modulo to create diversity
+        # but still maintain some uniqueness
+        row_num + 1
+
+      t when t in ["character varying", "varchar", "char", "character", "text"] ->
+        # For text columns, append row_num to make combinations unique
+        base = do_generate_value(column, profile, pk_cache)
+        max_len = column[:char_max_length] || 255
+        unique_str = "#{base}_#{row_num}"
+        String.slice(unique_str, 0, max_len)
+
+      _ ->
+        # For other types, fall back to normal generation
+        do_generate_value(column, profile, pk_cache)
+    end
+  end
+
+  defp generate_unique_value(column, table_name, row_num) do
+    data_type = column.data_type || column[:udt_name]
+    col_name = column.name
+
+    case data_type do
+      "uuid" ->
+        ValueGenerator.generate_uuid()
+
+      t when t in ["character varying", "varchar", "char", "character", "text"] ->
+        # Generate unique string using table_column_rownum pattern
+        max_len = column[:char_max_length] || 255
+        unique_str = "#{table_name}_#{col_name}_#{row_num}"
+        String.slice(unique_str, 0, max_len)
+
+      t when t in ["integer", "int4", "smallint", "int2", "bigint", "int8"] ->
+        # Use row number as unique integer
+        row_num + 1
+
+      _ ->
+        # Fallback: use UUID for unknown types
+        ValueGenerator.generate_uuid()
     end
   end
 
   defp do_generate_value(column, profile, pk_cache) do
-    case profile[:pattern] do
-      :fk_reference ->
-        generate_fk_reference(profile[:fk_table], profile[:fk_column], pk_cache)
+    data_type = column.data_type || column[:udt_name]
 
-      :email ->
-        ValueGenerator.generate_email()
+    # ALWAYS check type first for types that have escaping issues with pg_stats sampling
+    # JSON/JSONB, inet, cidr - these must be generated fresh, never from sample_values
+    cond do
+      data_type in ["json", "jsonb"] ->
+        ValueGenerator.generate_json(:object)
 
-      :uuid ->
-        ValueGenerator.generate_uuid()
+      data_type == "inet" ->
+        ValueGenerator.generate_inet()
 
-      :phone ->
-        ValueGenerator.generate_phone()
+      data_type == "cidr" ->
+        "#{ValueGenerator.generate_inet()}/24"
 
-      :url ->
-        ValueGenerator.generate_url()
+      true ->
+        # Now check pattern-based generation
+        case profile[:pattern] do
+          :fk_reference ->
+            generate_fk_reference(profile[:fk_table], profile[:fk_column], pk_cache)
 
-      :full_name ->
-        ValueGenerator.generate_name()
+          :email ->
+            ValueGenerator.generate_email()
 
-      :first_name ->
-        ValueGenerator.generate_first_name()
+          :uuid ->
+            ValueGenerator.generate_uuid()
 
-      :generic_text ->
-        min_len = profile[:min_length] || 10
-        max_len = profile[:max_length] || 100
-        ValueGenerator.generate_text(min_len, max_len)
+          :phone ->
+            ValueGenerator.generate_phone()
 
-      :low_cardinality ->
-        ValueGenerator.generate_from_values(profile[:sample_values], profile[:value_frequencies])
+          :url ->
+            ValueGenerator.generate_url()
 
-      _ ->
-        generate_by_type(column, profile)
+          :full_name ->
+            ValueGenerator.generate_name()
+
+          :first_name ->
+            ValueGenerator.generate_first_name()
+
+          :generic_text ->
+            min_len = profile[:min_length] || 10
+            max_len = profile[:max_length] || 100
+            ValueGenerator.generate_text(min_len, max_len)
+
+          :low_cardinality ->
+            ValueGenerator.generate_from_values(profile[:sample_values], profile[:value_frequencies])
+
+          _ ->
+            generate_by_type(column, profile)
+        end
     end
   end
 
@@ -300,6 +480,12 @@ defmodule PgGaConf.DataGenerator.DataGenerator do
 
       t when t in ["json", "jsonb"] ->
         ValueGenerator.generate_json(:object)
+
+      "inet" ->
+        ValueGenerator.generate_inet()
+
+      "cidr" ->
+        "#{ValueGenerator.generate_inet()}/24"
 
       _ ->
         # Fallback to text

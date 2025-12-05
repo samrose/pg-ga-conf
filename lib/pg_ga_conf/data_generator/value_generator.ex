@@ -262,6 +262,14 @@ defmodule PgGaConf.DataGenerator.ValueGenerator do
   end
 
   @doc """
+  Generates a random IPv4 address.
+  """
+  def generate_inet do
+    octets = for _ <- 1..4, do: :rand.uniform(256) - 1
+    Enum.join(octets, ".")
+  end
+
+  @doc """
   Generates an array of values using the provided generator function.
   """
   def generate_array(generator_fn, min_len, max_len) do

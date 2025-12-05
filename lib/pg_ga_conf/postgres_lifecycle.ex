@@ -214,33 +214,67 @@ defmodule PgGaConf.PostgresLifecycle do
   end
 
   defp do_restart_target(pgdata) do
-    Logger.info("Restarting TARGET PostgreSQL (stop then start)...")
+    # Verify we have the correct PGDATA (must be target, not app)
+    app_pgdata = System.get_env("PGDATA_APP") || System.get_env("PGDATA")
 
-    # Stop
-    stop_result = System.cmd("pg_ctl", ["stop", "-D", pgdata, "-m", "fast", "-w", "-t", "10"],
-      stderr_to_stdout: true
-    )
+    if app_pgdata && Path.expand(pgdata) == Path.expand(app_pgdata) do
+      Logger.error("CRITICAL: Attempted to restart App DB instead of Target DB! Aborting.")
+      {:error, :wrong_database}
+    else
+      Logger.info("Restarting TARGET PostgreSQL (stop then start)...")
+      Logger.debug("Using PGDATA: #{pgdata}")
 
-    case stop_result do
-      {_, 0} ->
-        Logger.debug("TARGET database stopped")
-      {output, code} ->
-        Logger.debug("pg_ctl stop returned #{code}: #{output}")
-    end
+      # Explicitly unset PGDATA to prevent pg_ctl from using the wrong database
+      # This is critical - pg_ctl can ignore -D if PGDATA is set in environment
+      clean_env = [{"PGDATA", nil}]
 
-    # Brief pause
-    Process.sleep(500)
+      # Stop with explicit data directory
+      stop_result = System.cmd("pg_ctl", ["stop", "-D", pgdata, "-m", "fast", "-w", "-t", "30"],
+        stderr_to_stdout: true,
+        env: clean_env
+      )
 
-    # Start
-    case System.cmd("pg_ctl", ["start", "-D", pgdata, "-l", "#{pgdata}/logfile"],
-           stderr_to_stdout: true) do
-      {_output, 0} ->
-        Logger.info("TARGET database start command issued")
-        :ok
+      case stop_result do
+        {_, 0} ->
+          Logger.debug("TARGET database stopped")
+        {output, code} ->
+          Logger.debug("pg_ctl stop returned #{code}: #{output}")
+      end
 
-      {output, code} ->
-        Logger.error("TARGET database start failed (code #{code}): #{output}")
-        {:error, {:postgres_start_failed, code}}
+      # Wait for shared memory to be released and PostgreSQL to fully stop
+      Process.sleep(1_500)
+
+      # Verify App DB is still running before starting Target
+      app_port = Application.get_env(:pg_ga_conf, :app_db_port, 5432)
+      case System.cmd("pg_isready", ["-h", "localhost", "-p", to_string(app_port), "-t", "1"],
+             stderr_to_stdout: true) do
+        {_, 0} ->
+          Logger.debug("App DB (port #{app_port}) still running - good")
+        {_, _} ->
+          Logger.error("WARNING: App DB (port #{app_port}) is not responding! Attempting to restart it...")
+          # Try to restart the App DB
+          app_pgdata = System.get_env("PGDATA_APP") || System.get_env("PGDATA")
+          if app_pgdata do
+            System.cmd("pg_ctl", ["start", "-D", app_pgdata, "-l", "#{app_pgdata}/logfile", "-w", "-t", "30"],
+              stderr_to_stdout: true,
+              env: clean_env
+            )
+            Process.sleep(2_000)
+          end
+      end
+
+      # Start with explicit data directory and wait for ready
+      case System.cmd("pg_ctl", ["start", "-D", pgdata, "-l", "#{pgdata}/logfile", "-w", "-t", "30"],
+             stderr_to_stdout: true,
+             env: clean_env) do
+        {_output, 0} ->
+          Logger.info("TARGET database start command issued")
+          :ok
+
+        {output, code} ->
+          Logger.error("TARGET database start failed (code #{code}): #{output}")
+          {:error, {:postgres_start_failed, code}}
+      end
     end
   end
 

@@ -43,6 +43,10 @@ defmodule PgGaConf.DataGenerator.SchemaBuilder do
     base_type = column.data_type
 
     cond do
+      # USER-DEFINED types (enums, composite types) - use the actual type name
+      base_type == "USER-DEFINED" and column[:udt_name] ->
+        column[:udt_name]
+
       # Character types with length
       base_type in ["character varying", "varchar", "char", "character"] and column[:char_max_length] ->
         "#{base_type}(#{column[:char_max_length]})"
@@ -54,6 +58,12 @@ defmodule PgGaConf.DataGenerator.SchemaBuilder do
         else
           "#{base_type}(#{column[:numeric_precision]})"
         end
+
+      # ARRAY types - use udt_name which has the proper array notation
+      base_type == "ARRAY" and column[:udt_name] ->
+        # udt_name for arrays is like "_int4", convert to "integer[]"
+        element_type = String.trim_leading(column[:udt_name], "_")
+        "#{element_type}[]"
 
       # Types without modifiers
       true ->

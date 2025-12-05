@@ -17,10 +17,53 @@
 #   TPE_ITERATIONS - Number of optimization iterations (default: 15)
 #   USE_SOBOL - Run Sobol sensitivity analysis (default: false)
 #   SOBOL_SAMPLES - Number of Sobol samples (default: 16)
+#   PARALLEL_WORKERS - Number of parallel PostgreSQL instances for Sobol (default: 1)
 #   VALIDATION_DURATION - Duration for final validation (default: 60)
 #   SKIP_VALIDATION - Skip validation phase (default: false)
 #   DEMO_CLONE - Demonstrate scan/clone workflow (default: false)
 #   CLEANUP - Drop demo database after demo (default: true)
+
+# =====================================================
+# Prevent concurrent runs
+# =====================================================
+lock_file = "/tmp/pgga_demo.lock"
+
+if File.exists?(lock_file) do
+  case File.read(lock_file) do
+    {:ok, pid_str} ->
+      pid = String.trim(pid_str)
+      # Check if that process is still running
+      case System.cmd("ps", ["-p", pid], stderr_to_stdout: true) do
+        {_, 0} ->
+          IO.puts """
+          ==========================================
+          ERROR: Another demo is already running!
+          ==========================================
+
+          Lock file: #{lock_file}
+          Process ID: #{pid}
+
+          If this is stale, remove the lock file:
+            rm #{lock_file}
+
+          """
+          System.halt(1)
+        _ ->
+          # Stale lock file, remove it
+          File.rm(lock_file)
+      end
+    _ ->
+      File.rm(lock_file)
+  end
+end
+
+# Create lock file with our PID
+File.write!(lock_file, "#{System.pid()}")
+
+# Ensure lock file is removed on exit
+System.at_exit(fn _ ->
+  File.rm(lock_file)
+end)
 
 IO.puts """
 ==========================================
@@ -42,10 +85,12 @@ clients = String.to_integer(System.get_env("PGBENCH_CLIENTS", "8"))
 iterations = String.to_integer(System.get_env("TPE_ITERATIONS", "15"))
 use_sobol = System.get_env("USE_SOBOL", "false") == "true"
 sobol_samples = String.to_integer(System.get_env("SOBOL_SAMPLES", "16"))
+parallel_workers = String.to_integer(System.get_env("PARALLEL_WORKERS", "1"))
 validation_duration = String.to_integer(System.get_env("VALIDATION_DURATION", "60"))
 skip_validation = System.get_env("SKIP_VALIDATION", "false") == "true"
 demo_clone = System.get_env("DEMO_CLONE", "false") == "true"
 cleanup = System.get_env("CLEANUP", "true") == "true"
+stop_dbs = System.get_env("STOP_DBS", "true") == "true"
 
 # Target database config
 target_host = "localhost"
@@ -59,7 +104,10 @@ IO.puts "  E-commerce scale: #{ecommerce_scale} (~#{round(100_000 * ecommerce_sc
 IO.puts "  Benchmark: #{duration}s, #{clients} clients"
 IO.puts "  TPE iterations: #{iterations}"
 IO.puts "  Use Sobol: #{use_sobol}"
-if use_sobol, do: IO.puts "  Sobol samples: #{sobol_samples}"
+if use_sobol do
+  IO.puts "  Sobol samples: #{sobol_samples}"
+  IO.puts "  Parallel workers: #{parallel_workers}"
+end
 IO.puts "  Validation: #{if skip_validation, do: "disabled", else: "#{validation_duration}s"}"
 IO.puts "  Demo clone workflow: #{demo_clone}"
 IO.puts ""
@@ -158,6 +206,27 @@ cleanup_fn = fn ->
   else
     IO.puts "   Skipping cleanup (CLEANUP=false)"
   end
+
+  # Stop PostgreSQL instances if requested (default: true)
+  if stop_dbs do
+    IO.puts "\n=== Stopping PostgreSQL ==="
+    pgdata_target = System.get_env("PGDATA_TARGET")
+    pgdata_app = System.get_env("PGDATA_APP") || System.get_env("PGDATA")
+
+    if pgdata_target && File.dir?(pgdata_target) do
+      IO.puts "   Stopping Target DB (port 5433)..."
+      System.cmd("pg_ctl", ["-D", pgdata_target, "stop", "-m", "fast", "-w", "-t", "30"],
+        stderr_to_stdout: true)
+    end
+
+    if pgdata_app && File.dir?(pgdata_app) do
+      IO.puts "   Stopping App DB (port 5432)..."
+      System.cmd("pg_ctl", ["-D", pgdata_app, "stop", "-m", "fast", "-w", "-t", "30"],
+        stderr_to_stdout: true)
+    end
+
+    IO.puts "   PostgreSQL stopped."
+  end
 end
 
 try do
@@ -166,9 +235,26 @@ try do
   # =====================================================
   IO.puts "\n2. Creating e-commerce database..."
 
-  # Drop if exists
-  System.cmd("dropdb", ["-h", target_host, "-p", target_port, "-U", target_user, "--if-exists", demo_db_name],
-    env: [{"PGPASSWORD", target_password}], stderr_to_stdout: true)
+  # Helper to force-drop a database (terminate connections first)
+  force_drop_db = fn db_name ->
+    # Terminate all connections to the database
+    run_target_psql.(
+      "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '#{db_name}' AND pid <> pg_backend_pid()",
+      "postgres"
+    )
+    Process.sleep(500)
+    # Drop the database
+    System.cmd("dropdb", ["-h", target_host, "-p", target_port, "-U", target_user, "--if-exists", db_name],
+      env: [{"PGPASSWORD", target_password}], stderr_to_stdout: true)
+  end
+
+  # Drop if exists (with force)
+  force_drop_db.(demo_db_name)
+
+  # Also drop clone database if it exists
+  if demo_clone do
+    force_drop_db.("ecommerce_clone")
+  end
 
   # Create database
   case System.cmd("createdb", ["-h", target_host, "-p", target_port, "-U", target_user, demo_db_name],
@@ -400,14 +486,38 @@ try do
           checkpoint_completion_target: {:continuous, 0.5, 0.9}
         }
 
-        restart_fn = fn restart_config ->
-          PostgresLifecycle.restart_target(config: restart_config)
+        # Parallel mode uses different approach - workers run their own benchmarks
+        sobol_opts = if parallel_workers > 1 do
+          IO.puts "   Using #{parallel_workers} parallel workers for Sobol analysis"
+          [
+            n_samples: sobol_samples,
+            use_cache: false,
+            parallel_workers: parallel_workers,
+            source_db: demo_db_name,
+            source_config: %{
+              host: target_host,
+              port: String.to_integer(target_port),
+              user: target_user,
+              password: target_password
+            },
+            benchmark_spec: %{
+              duration: duration,
+              clients: clients,
+              workload_file: workload_file
+            }
+          ]
+        else
+          restart_fn = fn restart_config ->
+            PostgresLifecycle.restart_target(config: restart_config)
+          end
+          [
+            n_samples: sobol_samples,
+            use_cache: false,
+            restart_fn: restart_fn
+          ]
         end
 
-        case Sobol.analyze(demo_space, benchmark_fn,
-               n_samples: sobol_samples,
-               use_cache: false,
-               restart_fn: restart_fn) do
+        case Sobol.analyze(demo_space, benchmark_fn, sobol_opts) do
           {:ok, indices} ->
             IO.puts "\n   Sensitivity indices:"
             indices
@@ -577,8 +687,9 @@ What this demo demonstrated:
 5. Validated results with longer benchmark
 
 To customize:
-  ECOMMERCE_SCALE=2.0 mix run demo_ecommerce.exs  # 2x data
-  USE_SOBOL=true mix run demo_ecommerce.exs        # With sensitivity analysis
-  DEMO_CLONE=true mix run demo_ecommerce.exs       # Demo scan/clone workflow
+  ECOMMERCE_SCALE=2.0 mix run demo_ecommerce.exs               # 2x data
+  USE_SOBOL=true mix run demo_ecommerce.exs                    # With sensitivity analysis
+  USE_SOBOL=true PARALLEL_WORKERS=4 mix run demo_ecommerce.exs # Parallel Sobol (~4x faster)
+  DEMO_CLONE=true mix run demo_ecommerce.exs                   # Demo scan/clone workflow
 
 """

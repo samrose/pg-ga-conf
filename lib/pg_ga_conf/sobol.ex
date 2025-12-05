@@ -34,6 +34,7 @@ defmodule PgGaConf.Sobol do
   alias PgGaConf.{Julia, Fingerprint, KnobSpace}
   alias PgGaConf.Benchmark.Pgbench
   alias PgGaConf.Schema.SobolCache
+  alias PgGaConf.Sobol.Parallel
 
   require Logger
 
@@ -63,15 +64,92 @@ defmodule PgGaConf.Sobol do
                     If provided, enables batched evaluation to minimize restarts.
   - `:on_batch_start` - Optional callback when a new batch starts (for progress reporting)
                         Called with (batch_index, total_batches, restart_param_values)
+  - `:parallel_workers` - Number of parallel PostgreSQL instances (default: 1, sequential)
+                          When > 1, spawns worker instances on ports 5434+ for parallel evaluation.
+                          Requires `:source_db` option.
+  - `:source_db` - Source database name for parallel workers to clone from
+  - `:source_config` - Source database connection config (host, port, user, password)
+  - `:benchmark_spec` - Benchmark specification for parallel workers (duration, clients, etc.)
 
   ## Benchmark Function
 
   The benchmark_fn receives a config map and returns {:ok, score} or {:error, reason}.
   Lower scores are better.
+
+  Note: When using parallel workers, benchmark_fn is not used - workers run pgbench directly.
   """
   @spec analyze(map(), (map() -> {:ok, float()} | {:error, term()}), keyword()) ::
           {:ok, sensitivity_indices()} | {:error, term()}
   def analyze(knob_space, benchmark_fn, opts \\ []) do
+    parallel_workers = Keyword.get(opts, :parallel_workers, 1)
+
+    if parallel_workers > 1 do
+      analyze_parallel(knob_space, opts)
+    else
+      analyze_sequential(knob_space, benchmark_fn, opts)
+    end
+  end
+
+  defp analyze_parallel(knob_space, opts) do
+    n_samples = Keyword.get(opts, :n_samples, @default_n_samples)
+    use_cache = Keyword.get(opts, :use_cache, true)
+    similarity_threshold = Keyword.get(opts, :similarity_threshold, @similarity_threshold)
+    repo = Keyword.get(opts, :repo, PgGaConf.Repo)
+
+    with {:ok, fingerprint} <- get_fingerprint(opts) do
+      knob_names = Map.keys(knob_space)
+
+      if use_cache do
+        case find_similar_cache(fingerprint, knob_names, similarity_threshold, repo) do
+          {:ok, cached_indices} ->
+            Logger.info("Sobol cache hit - reusing cached sensitivity indices")
+            {:ok, cached_indices}
+
+          :not_found ->
+            Logger.info("Sobol cache miss - running parallel analysis")
+            run_parallel_analysis(knob_space, n_samples, opts, fingerprint, knob_names, repo)
+        end
+      else
+        run_parallel_analysis(knob_space, n_samples, opts, fingerprint, knob_names, repo)
+      end
+    end
+  end
+
+  defp run_parallel_analysis(knob_space, n_samples, opts, fingerprint, knob_names, repo) do
+    # Convert knob space to Julia format
+    julia_knobs = encode_knob_space_for_julia(knob_space)
+
+    # Generate Sobol samples via Julia
+    with {:ok, %{"samples" => samples, "matrices" => matrices}} <-
+           Julia.generate_sobol_samples(julia_knobs, n_samples) do
+      # Decode samples to config maps
+      decoded_samples = Enum.map(samples, &decode_sample_to_config(&1, knob_space))
+
+      Logger.info("Generated #{length(decoded_samples)} Sobol samples for parallel evaluation")
+
+      # Run parallel evaluation
+      parallel_opts = [
+        parallel_workers: Keyword.get(opts, :parallel_workers, 4),
+        source_db: Keyword.get(opts, :source_db, "pgga_target"),
+        source_config: Keyword.get(opts, :source_config),
+        benchmark_spec: Keyword.get(opts, :benchmark_spec, %{duration: 15, clients: 8})
+      ]
+
+      with {:ok, indexed_results} <- Parallel.evaluate(decoded_samples, knob_space, parallel_opts) do
+        # Extract scores in order
+        results = Enum.map(indexed_results, fn {_idx, score} -> score end)
+
+        # Compute sensitivity indices via Julia
+        with {:ok, indices} <- Julia.compute_sensitivity(results, matrices, julia_knobs) do
+          decoded_indices = decode_indices(indices, knob_space)
+          save_to_cache(fingerprint, knob_names, decoded_indices, repo)
+          {:ok, decoded_indices}
+        end
+      end
+    end
+  end
+
+  defp analyze_sequential(knob_space, benchmark_fn, opts) do
     n_samples = Keyword.get(opts, :n_samples, @default_n_samples)
     use_cache = Keyword.get(opts, :use_cache, true)
     similarity_threshold = Keyword.get(opts, :similarity_threshold, @similarity_threshold)
@@ -376,12 +454,19 @@ defmodule PgGaConf.Sobol do
           # Run all samples in this batch
           batch_results =
             batch_samples
-            |> Enum.map(fn {idx, config} ->
+            |> Enum.with_index()
+            |> Enum.map(fn {{idx, config}, sample_idx} ->
+              Logger.info("  Sample #{sample_idx + 1}/#{length(batch_samples)} in batch #{batch_idx}: config=#{inspect(Map.take(config, [:shared_buffers, :work_mem]))}")
+
               # The benchmark_fn handles applying all config (including non-restart params)
               result =
                 case benchmark_fn.(config) do
-                  {:ok, score} -> score
-                  {:error, _} -> 1.0e10
+                  {:ok, score} ->
+                    Logger.info("  Sample #{sample_idx + 1} complete: score=#{score}")
+                    score
+                  {:error, reason} ->
+                    Logger.warning("  Sample #{sample_idx + 1} failed: #{inspect(reason)}")
+                    1.0e10
                 end
 
               {idx, result}
