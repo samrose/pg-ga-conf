@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: julia-sobol
+  namespace: pgga
+  labels:
+    app.kubernetes.io/name: julia-sobol
+    app.kubernetes.io/component: analysis
+    app.kubernetes.io/part-of: pg-ga-conf
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: julia-sobol
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: julia-sobol
+        app.kubernetes.io/component: analysis
+    spec:
+      containers:
+        - name: julia
+          image: pgga/julia-sobol:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 9999
+              name: tcp
+              protocol: TCP
+          env:
+            - name: SERVER_MODE
+              value: "tcp"
+            - name: SERVER_PORT
+              value: "9999"
+            - name: JULIA_NUM_THREADS
+              value: "4"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          livenessProbe:
+            tcpSocket:
+              port: 9999
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: 9999
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: julia-service
+  namespace: pgga
+  labels:
+    app.kubernetes.io/name: julia-sobol
+    app.kubernetes.io/component: analysis
+spec:
+  type: ClusterIP
+  ports:
+    - port: 9999
+      targetPort: 9999
+      protocol: TCP
+      name: tcp
+  selector:
+    app.kubernetes.io/name: julia-sobol

@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgga
+  namespace: pgga
+  labels:
+    app.kubernetes.io/name: pgga
+    app.kubernetes.io/component: optimizer
+    app.kubernetes.io/part-of: pg-ga-conf
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pgga
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pgga
+        app.kubernetes.io/component: optimizer
+    spec:
+      containers:
+        - name: pgga
+          image: pgga/elixir:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 4000
+              name: http
+              protocol: TCP
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: pgga-secrets
+                  key: database-url
+            - name: SECRET_KEY_BASE
+              valueFrom:
+                secretKeyRef:
+                  name: pgga-secrets
+                  key: secret-key-base
+            - name: JULIA_SERVICE_HOST
+              value: "julia-service"
+            - name: JULIA_SERVICE_PORT
+              value: "9999"
+            - name: POOL_SIZE
+              value: "10"
+            - name: PHX_SERVER
+              value: "true"
+            - name: PORT
+              value: "4000"
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 4000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 4000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pgga-service
+  namespace: pgga
+  labels:
+    app.kubernetes.io/name: pgga
+    app.kubernetes.io/component: optimizer
+spec:
+  type: ClusterIP
+  ports:
+    - port: 4000
+      targetPort: 4000
+      protocol: TCP
+      name: http
+  selector:
+    app.kubernetes.io/name: pgga

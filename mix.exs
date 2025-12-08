@@ -5,7 +5,7 @@ defmodule PgGaConf.MixProject do
     [
       app: :pg_ga_conf,
       version: "0.1.0",
-      elixir: "~> 1.16",
+      elixir: "~> 1.18",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -27,6 +27,7 @@ defmodule PgGaConf.MixProject do
     [
       # Database
       {:postgrex, "~> 0.17"},
+      {:ecto_sql, "~> 3.11"},
       {:db_connection, "~> 2.5"},
 
       # JSON
@@ -51,6 +52,12 @@ defmodule PgGaConf.MixProject do
       {:telemetry_metrics, "~> 0.6"},
       {:telemetry_poller, "~> 1.0"},
 
+      # Python integration for Optuna (TPE, CMA-ES)
+      {:pythonx, "~> 0.4"},
+
+      # External process management for Julia
+      {:erlexec, "~> 2.2"},
+
       # Testing
       {:ex_unit_notifier, "~> 1.3", only: :test},
       {:mix_test_watch, "~> 1.1", only: :dev, runtime: false}
@@ -59,7 +66,12 @@ defmodule PgGaConf.MixProject do
 
   defp aliases do
     [
-      test: ["test --no-start"]
+      setup: ["deps.get", "ecto.setup"],
+      "ecto.setup": ["ecto.create", "ecto.migrate"],
+      "ecto.reset": ["ecto.drop", "ecto.setup"],
+      # Unit tests don't need database - use test.integration for full tests
+      test: ["test"],
+      "test.integration": ["ecto.create --quiet", "ecto.migrate --quiet", "test --include integration"]
     ]
   end
 end

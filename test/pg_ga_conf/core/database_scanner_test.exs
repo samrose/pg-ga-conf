@@ -1,6 +1,8 @@
 defmodule PgGaConf.Core.DatabaseScannerTest do
   use ExUnit.Case
 
+  @moduletag :integration
+
   alias PgGaConf.Core.{DatabaseScanner, ScanResult}
   alias PgGaConf.TestHelpers
 

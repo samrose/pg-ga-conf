@@ -1,0 +1,84 @@
+# Multi-stage Dockerfile for PgGaConf Elixir application
+# Uses Nix for reproducible builds
+
+# Stage 1: Build with Nix
+FROM nixos/nix:latest AS builder
+
+WORKDIR /app
+
+# Enable flakes
+RUN mkdir -p ~/.config/nix && \
+    echo "experimental-features = nix-command flakes" >> ~/.config/nix/nix.conf
+
+# Copy flake files first for better caching
+COPY flake.nix flake.lock ./
+
+# Build dependencies (cached layer)
+RUN nix develop --command echo "Dependencies cached"
+
+# Copy source code
+COPY mix.exs mix.lock ./
+COPY config config
+COPY lib lib
+COPY priv priv
+
+# Build release
+RUN nix develop --command bash -c "\
+    export MIX_ENV=prod && \
+    mix local.hex --force && \
+    mix local.rebar --force && \
+    mix deps.get --only prod && \
+    mix compile && \
+    mix release"
+
+# Stage 2: Runtime image
+FROM debian:bookworm-slim AS runtime
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl3 \
+    libncurses6 \
+    locales \
+    ca-certificates \
+    postgresql-client \
+    python3 \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen \
+    && locale-gen
+
+# Install Python dependencies for Pythonx
+RUN pip3 install --break-system-packages optuna numpy
+
+ENV LANG=en_US.UTF-8 \
+    LANGUAGE=en_US:en \
+    LC_ALL=en_US.UTF-8 \
+    MIX_ENV=prod
+
+WORKDIR /app
+
+# Create non-root user
+RUN groupadd -r pgga && useradd -r -g pgga pgga
+
+# Copy release from builder
+COPY --from=builder /app/_build/prod/rel/pg_ga_conf ./
+
+# Set permissions
+RUN chown -R pgga:pgga /app
+
+USER pgga
+
+# Environment variables for configuration
+ENV DATABASE_URL=""
+ENV JULIA_SERVICE_HOST="julia-service"
+ENV JULIA_SERVICE_PORT="9999"
+ENV SECRET_KEY_BASE=""
+ENV PORT="4000"
+
+EXPOSE 4000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD /app/bin/pg_ga_conf eval "IO.puts(:ok)" || exit 1
+
+ENTRYPOINT ["/app/bin/pg_ga_conf"]
+CMD ["start"]
