@@ -214,11 +214,152 @@ defmodule PgGaConf.Sobol do
 
   Skips Sobol and uses domain knowledge about important knobs per workload type.
   Useful when Sobol analysis is too expensive.
+
+  ## Legacy API - prefer `analyze_for_workload/2` for new code
   """
   @spec quick_reduce(workload_type :: Fingerprint.workload_type()) :: map()
   def quick_reduce(:oltp), do: KnobSpace.oltp_knobs()
   def quick_reduce(:olap), do: KnobSpace.olap_knobs()
   def quick_reduce(:mixed), do: KnobSpace.mixed_knobs()
+
+  # ============================================================================
+  # Workload-aware Sobol analysis (new API)
+  # ============================================================================
+
+  @doc """
+  Profile workload, classify, and run Sobol on the relevant knob subset.
+
+  This is the recommended entry point for workload-aware sensitivity analysis.
+  It combines:
+  1. Workload profiling (from pg_stat_* views)
+  2. Archetype classification (rule-based decision tree)
+  3. Knob selection (archetype → relevant knobs)
+  4. Sobol analysis (on reduced knob space)
+
+  ## Options
+
+  All options from `analyze/3` are supported, plus:
+
+  - `:profile_opts` - Options passed to `Workload.Profiler.profile/1`
+
+  ## Returns
+
+  Returns a tuple with classification result and sensitivity indices:
+
+      {:ok, %{
+        archetype: :analytical,
+        confidence: 0.85,
+        reasons: ["60% sequential scans", ...],
+        knob_count: 20,
+        indices: %{work_mem: %{s1: 0.15, st: 0.22}, ...}
+      }}
+
+  ## Example
+
+      # Profile, classify, and analyze in one call
+      {:ok, result} = Sobol.analyze_for_workload(benchmark_fn, n_samples: 64)
+
+      # Check what archetype was detected
+      result.archetype
+      #=> :analytical
+
+      # Get the most important knobs
+      Sobol.filter_important(result.indices, threshold: 0.05)
+      #=> [:work_mem, :max_parallel_workers_per_gather, ...]
+  """
+  @spec analyze_for_workload((map() -> {:ok, float()} | {:error, term()}), keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def analyze_for_workload(benchmark_fn, opts \\ []) do
+    alias PgGaConf.Workload.{Profiler, Classifier}
+
+    profile_opts = Keyword.get(opts, :profile_opts, [])
+    repo = Keyword.get(opts, :repo, PgGaConf.Repo)
+
+    Logger.info("Starting workload-aware Sobol analysis...")
+
+    with {:ok, profile} <- Profiler.profile(Keyword.put(profile_opts, :repo, repo)) do
+      classification = Classifier.classify(profile)
+
+      Logger.info(
+        "Workload classified as #{classification.archetype} " <>
+          "(confidence: #{Float.round(classification.confidence * 100, 1)}%)"
+      )
+
+      for reason <- classification.reasons do
+        Logger.info("  - #{reason}")
+      end
+
+      # Get the knob space for this archetype
+      knob_space = KnobSpace.space_for_archetype(classification.archetype)
+      knob_count = map_size(knob_space)
+
+      Logger.info("Selected #{knob_count} knobs for analysis: #{inspect(Map.keys(knob_space))}")
+
+      # Estimate cost
+      n_samples = Keyword.get(opts, :n_samples, @default_n_samples)
+      total_evals = 2 * (knob_count + 1) * n_samples
+
+      Logger.info(
+        "Sobol analysis will require #{total_evals} evaluations " <>
+          "(#{knob_count} knobs × #{n_samples} samples)"
+      )
+
+      # Run Sobol on the reduced knob space
+      case analyze(knob_space, benchmark_fn, opts) do
+        {:ok, indices} ->
+          {:ok,
+           %{
+             archetype: classification.archetype,
+             confidence: classification.confidence,
+             reasons: classification.reasons,
+             knob_count: knob_count,
+             indices: indices,
+             profile: profile
+           }}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  @doc """
+  Estimate the cost (number of evaluations) for Sobol analysis of an archetype.
+
+  ## Example
+
+      iex> Sobol.estimate_cost(:analytical, n_samples: 128)
+      %{knobs: 20, samples: 128, evaluations: 5376, estimated_hours: 22.4}
+  """
+  @spec estimate_cost(atom(), keyword()) :: map()
+  def estimate_cost(archetype, opts \\ []) do
+    n_samples = Keyword.get(opts, :n_samples, @default_n_samples)
+    seconds_per_eval = Keyword.get(opts, :seconds_per_eval, 15)
+
+    knob_count = length(KnobSpace.for_archetype(archetype))
+    evaluations = 2 * (knob_count + 1) * n_samples
+    total_seconds = evaluations * seconds_per_eval
+
+    %{
+      knobs: knob_count,
+      samples: n_samples,
+      evaluations: evaluations,
+      estimated_hours: Float.round(total_seconds / 3600, 1)
+    }
+  end
+
+  @doc """
+  List all archetypes with their knob counts and estimated Sobol costs.
+  """
+  @spec list_archetype_costs(keyword()) :: [map()]
+  def list_archetype_costs(opts \\ []) do
+    KnobSpace.archetypes()
+    |> Enum.map(fn archetype ->
+      estimate_cost(archetype, opts)
+      |> Map.put(:archetype, archetype)
+    end)
+    |> Enum.sort_by(& &1.evaluations)
+  end
 
   # Private functions
 
