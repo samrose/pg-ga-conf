@@ -37,6 +37,7 @@ defmodule PgGaConf.TuningJob do
   require Logger
 
   alias PgGaConf.{Optimizer, Benchmark, KnobSpace, Fingerprint, Sobol, ResultStore}
+  alias PgGaConf.{PatternMatcher, PatternValidation}
   alias PgGaConf.Schema.Session
 
   @checkpoint_interval_ms 1_000
@@ -368,33 +369,58 @@ defmodule PgGaConf.TuningJob do
   defp determine_knob_space(fingerprint, opts, use_sobol, benchmark_mod, benchmark_state) do
     case Keyword.get(opts, :knob_space) do
       nil ->
-        if use_sobol do
-          # Run Sobol analysis
-          full_space = KnobSpace.all_knobs()
+        db_id = Keyword.get(opts, :db_id, "unknown")
+        repo = Keyword.get(opts, :repo, PgGaConf.Repo)
+        profile_repo = Keyword.get(opts, :profile_repo, repo)
+        use_patterns = Keyword.get(opts, :use_patterns, true)
 
-          benchmark_fn = fn config ->
-            :ok = benchmark_mod.apply_config(benchmark_state, config)
-            benchmark_mod.run(benchmark_state)
-          end
+        cond do
+          use_sobol ->
+            # Run Sobol analysis directly
+            run_sobol_for_knobs(benchmark_mod, benchmark_state, fingerprint)
 
-          case Sobol.analyze(full_space, benchmark_fn, fingerprint: fingerprint) do
-            {:ok, indices} ->
-              reduced = Sobol.reduce_knob_space(full_space, indices)
-              {:ok, reduced}
+          use_patterns ->
+            # Try pattern-based knob selection first
+            case PatternMatcher.get_knobs_for_database(db_id, profile_repo, repo) do
+              {:ok, %{knobs: knobs, source: source}} ->
+                Logger.info("Using #{source} knobs: #{Enum.join(knobs, ", ")}")
+                knob_atoms = Enum.map(knobs, &String.to_existing_atom/1)
+                {:ok, KnobSpace.subset(knob_atoms)}
 
-            {:error, _reason} ->
-              # Fall back to workload-based selection
-              workload_type = Fingerprint.classify(fingerprint)
-              {:ok, Sobol.quick_reduce(workload_type)}
-          end
-        else
-          # Use workload-based knob selection
-          workload_type = Fingerprint.classify(fingerprint)
-          {:ok, Sobol.quick_reduce(workload_type)}
+              {:needs_validation, %{reason: reason}} ->
+                Logger.info("No pattern match (#{reason}), running Sobol analysis")
+                run_sobol_for_knobs(benchmark_mod, benchmark_state, fingerprint)
+            end
+
+          true ->
+            # Legacy: Use workload-based knob selection
+            workload_type = Fingerprint.classify(fingerprint)
+            {:ok, Sobol.quick_reduce(workload_type)}
         end
 
       custom_space ->
         {:ok, custom_space}
+    end
+  end
+
+  defp run_sobol_for_knobs(benchmark_mod, benchmark_state, fingerprint) do
+    # Use starter knobs from PatternValidation
+    starter_space = KnobSpace.subset(PatternValidation.starter_knobs())
+
+    benchmark_fn = fn config ->
+      :ok = benchmark_mod.apply_config(benchmark_state, config)
+      benchmark_mod.run(benchmark_state)
+    end
+
+    case Sobol.analyze(starter_space, benchmark_fn, fingerprint: fingerprint) do
+      {:ok, indices} ->
+        reduced = Sobol.reduce_knob_space(starter_space, indices)
+        {:ok, reduced}
+
+      {:error, _reason} ->
+        # Fall back to workload-based selection
+        workload_type = Fingerprint.classify(fingerprint)
+        {:ok, Sobol.quick_reduce(workload_type)}
     end
   end
 

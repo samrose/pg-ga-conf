@@ -82,9 +82,82 @@ defmodule PgGaConf.Migrations do
 
     create index(:pg_ga_conf_sobol_cache, [:workload_type])
     create index(:pg_ga_conf_sobol_cache, [:knob_names])
+
+    # =========================================================================
+    # Pattern Discovery Tables (Phase 2)
+    # =========================================================================
+
+    # Database profiles (time series of 59-feature profiles)
+    create table(:pg_ga_conf_database_profiles, primary_key: false) do
+      add :id, :binary_id, primary_key: true
+      add :db_id, :string, null: false
+      add :captured_at, :utc_datetime, null: false
+
+      # Feature groups (for analysis/debugging)
+      add :schema_features, :map
+      add :query_features, :map
+      add :execution_features, :map
+      add :io_features, :map
+      add :index_features, :map
+      add :runtime_features, :map
+      add :scale_features, :map
+
+      # Normalized feature vector (59 floats)
+      add :feature_vector, {:array, :float}, null: false
+
+      # Metadata
+      add :has_pg_stat_statements, :boolean, default: false
+      add :pg_version, :integer
+      add :profile_duration_ms, :integer
+
+      timestamps(type: :utc_datetime)
+    end
+
+    create index(:pg_ga_conf_database_profiles, [:db_id])
+    create index(:pg_ga_conf_database_profiles, [:captured_at])
+    create unique_index(:pg_ga_conf_database_profiles, [:db_id, :captured_at])
+
+    # Workload patterns (discovered clusters)
+    create table(:pg_ga_conf_workload_patterns, primary_key: false) do
+      add :id, :binary_id, primary_key: true
+
+      # Cluster geometry
+      add :centroid_vector, {:array, :float}, null: false
+      add :radius, :float
+      add :member_count, :integer, default: 0
+
+      # Sobol validation results (null until validated)
+      add :validated_knobs, {:array, :string}
+      add :sobol_indices, :map
+      add :sobol_validated_at, :utc_datetime
+      add :sobol_db_id, :string
+
+      # Metadata
+      add :description, :string
+
+      timestamps(type: :utc_datetime)
+    end
+
+    # Database -> Pattern assignments
+    create table(:pg_ga_conf_pattern_assignments, primary_key: false) do
+      add :db_id, :string, primary_key: true
+      add :pattern_id, references(:pg_ga_conf_workload_patterns, type: :binary_id, on_delete: :nilify_all)
+      add :similarity, :float
+      add :assigned_at, :utc_datetime
+
+      # Database-specific validation (if no pattern match)
+      add :custom_validated_knobs, {:array, :string}
+      add :custom_sobol_indices, :map
+      add :custom_validated_at, :utc_datetime
+    end
+
+    create index(:pg_ga_conf_pattern_assignments, [:pattern_id])
   end
 
   def down do
+    drop_if_exists table(:pg_ga_conf_pattern_assignments)
+    drop_if_exists table(:pg_ga_conf_workload_patterns)
+    drop_if_exists table(:pg_ga_conf_database_profiles)
     drop table(:pg_ga_conf_sobol_cache)
     drop table(:pg_ga_conf_sessions)
     drop table(:pg_ga_conf_observations)
