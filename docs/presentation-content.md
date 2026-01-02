@@ -4,7 +4,7 @@
 
 ---
 
-## Slide 1: The Problem
+## 1: The Problem
 
 **PostgreSQL has 300+ configuration parameters**
 
@@ -19,7 +19,7 @@
 
 ---
 
-## Slide 2: Our Solution
+## 2: Our Solution
 
 **PgGaConf: ML-Powered PostgreSQL Auto-Tuning**
 
@@ -33,7 +33,7 @@ A complete pipeline that:
 
 ---
 
-## Slide 3: Architecture Overview
+## 3: Architecture Overview
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
@@ -54,7 +54,7 @@ A complete pipeline that:
 
 ---
 
-## Slide 4: Step 1 - Database Scanning
+## 4: Step 1 - Database Scanning
 
 **What we capture:**
 
@@ -80,7 +80,7 @@ A complete pipeline that:
 
 ---
 
-## Slide 5: Step 2 - Database Cloning
+## 5: Step 2 - Database Cloning
 
 **Why clone?**
 
@@ -102,7 +102,7 @@ Source DB ──pg_dump──▶ ──pg_restore──▶ Target DB
 
 ---
 
-## Slide 6: Step 3 - Sobol Sensitivity Analysis
+## 6: Step 3 - Sobol Sensitivity Analysis
 
 **The Key Innovation: Know What Matters**
 
@@ -127,7 +127,7 @@ checkpoint_completion_target | 0.04  █
 
 ---
 
-## Slide 7: How Sobol Works
+## 7: How Sobol Works
 
 **Parallel Worker Architecture:**
 
@@ -159,7 +159,7 @@ checkpoint_completion_target | 0.04  █
 
 ---
 
-## Slide 8: Step 4 - TPE Optimization
+## 8: Step 4 - TPE Optimization
 
 **Tree-structured Parzen Estimator (TPE)**
 
@@ -187,7 +187,7 @@ Iteration | TPS      | Best So Far | Exploring
 
 ---
 
-## Slide 9: Step 5 - Validation
+## 9: Step 5 - Validation
 
 **Trust but Verify**
 
@@ -219,7 +219,7 @@ Confidence:      HIGH (variance < 5%)
 
 ---
 
-## Slide 10: The Knob Space
+## 10: The Knob Space
 
 **Parameters We Tune:**
 
@@ -238,7 +238,7 @@ Confidence:      HIGH (variance < 5%)
 
 ---
 
-## Slide 11: Real Results - E-commerce Demo
+## 11: Real Results - E-commerce Demo
 
 **Test Setup:**
 - 12 tables (users, orders, products, reviews, etc.)
@@ -265,7 +265,7 @@ Confidence:      HIGH (variance < 5%)
 
 ---
 
-## Slide 12: Technology Stack
+## 12: Technology Stack
 
 | Component | Technology | Purpose |
 |-----------|------------|---------|
@@ -282,7 +282,7 @@ Confidence:      HIGH (variance < 5%)
 
 ---
 
-## Slide 13: Key Features
+## 13: Key Features
 
 **Production-Ready Design:**
 
@@ -300,7 +300,7 @@ Confidence:      HIGH (variance < 5%)
 
 ---
 
-## Slide 14: Workflow Summary
+## 14: Workflow Summary
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -329,7 +329,7 @@ Confidence:      HIGH (variance < 5%)
 
 ---
 
-## Slide 15: Getting Started
+## 15: Getting Started
 
 **Run the Demo:**
 
@@ -356,7 +356,49 @@ mix run demo_ecommerce.exs
 
 ---
 
-## Slide 16: Future Roadmap
+## 16: Workload Pattern Discovery (WIP)
+
+**The Problem:** Sobol analysis is computationally expensive (~32+ benchmark runs per database)
+
+**The Solution:** Discover natural workload patterns, validate once per pattern, reuse for similar databases
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Database Fleet                                                      │
+│                                                                      │
+│    DB1 ──┐                    ┌── Pattern A ──▶ Sobol ──▶ Knobs     │
+│    DB2 ──┼── RichProfiler ───▶│                  (once)    [reuse]  │
+│    DB3 ──┤   (59 features)    │                                      │
+│    DB4 ──┤        │           ├── Pattern B ──▶ Sobol ──▶ Knobs     │
+│    DB5 ──┘        │           │                  (once)    [reuse]  │
+│                   ▼           │                                      │
+│              DBSCAN ──────────┴── Outliers ──▶ Direct Sobol         │
+│            Clustering                                                │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**How it works:**
+
+| Step | What | Why |
+|------|------|-----|
+| 1. Profile | Extract 59 features (schema, queries, I/O, runtime) | Rich workload fingerprint |
+| 2. Cluster | DBSCAN groups similar profiles | Discovers natural patterns |
+| 3. Validate | Sobol on representative DB per pattern | One-time cost per pattern |
+| 4. Match | New DBs matched by cosine similarity | Skip Sobol if similarity ≥ 85% |
+
+**Cost savings at scale:**
+
+| Fleet Size | Without Patterns | With Patterns |
+|------------|------------------|---------------|
+| 10 DBs | 10 × Sobol | 2-3 × Sobol |
+| 100 DBs | 100 × Sobol | 5-10 × Sobol |
+| 1000 DBs | 1000 × Sobol | 10-20 × Sobol |
+
+**Status:** Core implementation complete, integration with TuningJob in progress.
+
+---
+
+## 17: Future Roadmap
 
 **Planned Enhancements:**
 
@@ -365,6 +407,7 @@ mix run demo_ecommerce.exs
 3. **Workload Recording** - Capture and replay production queries
 4. **Multi-objective** - Balance throughput vs latency vs cost
 5. **Continuous Tuning** - Adapt as workload changes
+6. **HDBSCAN Upgrade** - Better clustering for varying-density patterns
 
 **Research Directions:**
 - Transfer learning across database types
@@ -373,7 +416,7 @@ mix run demo_ecommerce.exs
 
 ---
 
-## Slide 17: Questions?
+## 18: Questions?
 
 **Resources:**
 
