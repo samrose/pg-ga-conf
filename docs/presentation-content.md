@@ -1,4 +1,4 @@
-# PgGaConf: Automated PostgreSQL Configuration Tuning
+# PgMLConf: Automated PostgreSQL Configuration Tuning
 
 ## Presentation Content for Slides
 
