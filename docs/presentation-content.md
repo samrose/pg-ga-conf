@@ -17,19 +17,26 @@
 - Wrong settings can cause 10x performance degradation
 - Right settings can provide 2-10x improvement
 
+PostgreSQL configuration is a "non-additive" system in the algebraic sense: because 
+- Interdependencies: The effect of one setting is often dependent on the value of another. For example, the shared_buffers parameter works in concert with work_mem, and their combined impact on performance is not merely the sum of their individual impacts in isolation
+- Thresholds and Saturation: Many parameters involve resource allocation (like memory or connections). Adding more memory via configuration might improve performance up to a certain point, but beyond a system's physical limits, adding more has no additional benefit, or can even degrade performance.
+- Logical Constraints: Certain parameters enforce logical rules where combinations can be invalid or produce unexpected behavior that isn't a "sum" of effects. 
+
 ---
 
-## 2: Our Solution
+## 2: Solution
 
-**PgGaConf: ML-Powered PostgreSQL Auto-Tuning**
+**PgMLConf: ML-Powered PostgreSQL Auto-Tuning**
 
 A complete pipeline that:
 1. Analyzes your database structure and workload
-2. Identifies which parameters matter most for YOUR workload
+2. Identifies which parameters matter most for YOUR workload (Sobol')
 3. Uses Bayesian optimization to find optimal values
 4. Validates improvements before recommending changes
 
 **Key differentiator:** We don't guess - we measure and learn.
+
+***In this experiment, just focusing on transactions per second improvement***
 
 ---
 
@@ -99,12 +106,23 @@ A complete pipeline that:
 Source DB ──pg_dump──▶ ──pg_restore──▶ Target DB
    (5432)                                (5433)
 ```
-
+Eventually this can be extended to clone structure empty, and fill to equal size with dummy data of matching type
 ---
 
-## 6: Step 3 - Sobol Sensitivity Analysis
+## 6: Step 3 - Sobol' Sensitivity Analysis
 
 **The Key Innovation: Know What Matters**
+
+### [Ilya Sobol'](https://en.wikipedia.org/wiki/Ilya_M._Sobol%27)
+
+Russian mathematician 
+
+![alt text](image.png)
+
+Invented Sobol' Sensitivity Analysis
+
+*Summary: a systematic way to find which configuration combinations have the most impact on a workload*
+
 
 Not all 300+ PostgreSQL parameters affect your workload equally.
 
@@ -127,7 +145,7 @@ checkpoint_completion_target | 0.04  █
 
 ---
 
-## 7: How Sobol Works
+## 7: How Sobol' Works
 
 **Parallel Worker Architecture:**
 
@@ -184,6 +202,9 @@ Iteration | TPS      | Best So Far | Exploring
 **Why TPE over Grid Search?**
 - Grid search: 10^8 combinations to test
 - TPE: Finds optimum in 20-50 iterations
+
+We borrow TPE from https://optuna.org/ "An open source hyperparameter optimization framework to automate hyperparameter search"
+
 
 ---
 
