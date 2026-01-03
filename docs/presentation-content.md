@@ -441,7 +441,7 @@ mix run demo_ecommerce.exs
 
 **Resources:**
 
-- GitHub: `pg-ga-conf`
+- GitHub: `pg-ml-conf`
 - Demo: `mix run demo_ecommerce.exs`
 - Docs: `docs/demo-walkthrough.md`
 
